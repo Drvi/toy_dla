@@ -1,22 +1,22 @@
 using Random: seed!, rand!
-using Makie: heatmap
+using SimpleDirectMediaLayer.LibSDL2
 
-const STEPS_TO_FRAME = 100 # do so many steps (of all walkers) before refreshing display
-const WORLD_HEIGHT = 512
-const WORLD_WIDTH = 512
-const N_PARTICLES = 65_536
+const WIDTH = 800
+const HEIGHT = 600
+const N_PARTICLES = 3 * 65_536
 const FROZEN_COORDS = [
-    (WORLD_HEIGHT÷2, WORLD_WIDTH÷2),
-    (WORLD_HEIGHT÷3, WORLD_WIDTH÷2),
-    (WORLD_HEIGHT÷2, WORLD_WIDTH÷3)
+    (HEIGHT ÷ 2, WIDTH ÷ 2),
+    (HEIGHT ÷ 3, WIDTH ÷ 2),
+    (HEIGHT ÷ 2, WIDTH ÷ 3)
 ]
+const RED = 0x00FF0000
+const WHITE = 0x00FFFFFF
 
 seed!(42)
 
 mutable struct Particle
     x::UInt16
     y::UInt16
-    frozen::Bool
 end
 
 function add_particles!(world, n)
@@ -25,14 +25,14 @@ function add_particles!(world, n)
     for i = 1:n
         x = rand(1:height)
         y = rand(1:width)
-        while world[x, y] != 0 # 0 ~ tile empty
+        while world[x, y] != 0 # BLACK ~ tile empty
             x = rand(1:height)
             y = rand(1:width)
         end
-        particles[i] = Particle(x, y, false)
-        world[x, y] = 1 # 1 ~ tile occupied by non-frozen
+        particles[i] = Particle(x, y)
+        world[x, y] = WHITE # WHITE ~ tile occupied by non-frozen
     end
-    particles
+    return particles
 end
 
 function resolve_move!(p::Particle, world, dest_x, dest_y)
@@ -41,9 +41,9 @@ function resolve_move!(p::Particle, world, dest_x, dest_y)
         @inbounds world[p.x, p.y], world[dest_x, dest_y] = world[dest_x, dest_y], world[p.x, p.y]
         p.x = dest_x
         p.y = dest_y
-    elseif candidate_spot_val == -1 # tile frozen
-        @inbounds world[p.x, p.y] = -1
-        p.frozen = true
+    elseif candidate_spot_val == RED # tile frozen
+        @inbounds world[p.x, p.y] = RED
+        p.x = p.y = 0
     end # don't move if you were about to collide with a non frozen
     return
 end
@@ -67,52 +67,62 @@ function move!(p::Particle, world, direction)
         y = y < 1 ? width : y
         resolve_move!(p, world, p.x, y)
     end
+    return
 end
 
 function step!(world, particles, directions)
+    any_change = false
     for (particle, direction) in zip(particles, directions)
-        particle.frozen && continue
+        particle.x == 0 && particle.y == 0 && continue
+        any_change = true
         move!(particle, world, direction)
     end
-    world
+    return any_change
 end
 
-function run!(world, particles, directions, n)
-    for _ = 1:n
-        rand!(directions, (1, 2, 3, 4))
-        step!(world, particles, directions)
+function simulate()
+    # The "double transpose" will leave us with a row-major array which we want to pass
+    # to SDL
+    world = transpose(reshape(zeros(UInt32, HEIGHT, WIDTH), WIDTH, HEIGHT))
+    for (x, y) in FROZEN_COORDS
+        world[x, y] = RED
     end
-    world
+    particles = add_particles!(world, N_PARTICLES)
+    directions = Vector{Int8}(undef, length(particles))
+
+    window = SDL_CreateWindow("DLA", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN)
+    SDL_SetWindowResizable(window, SDL_FALSE)
+    
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC)
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
+    window_should_close = false
+    try
+        while !window_should_close
+            event_ref = Ref{SDL_Event}()
+            while Bool(SDL_PollEvent(event_ref))
+                evt = event_ref[]
+                evt_ty = evt.type
+                if evt_ty == SDL_QUIT
+                    window_should_close = true
+                    break
+                end
+            end
+
+            rand!(directions, (1, 2, 3, 4))
+            window_should_close = !step!(world, particles, directions)
+
+            SDL_UpdateTexture(texture, C_NULL, world, WIDTH * sizeof(UInt32))
+            SDL_RenderClear(renderer);
+            SDL_RenderCopy(renderer, texture, C_NULL, C_NULL);
+            SDL_RenderPresent(renderer);
+        end
+    finally
+        SDL_DestroyTexture(texture)
+        SDL_DestroyRenderer(renderer)
+        SDL_DestroyWindow(window)
+        SDL_Quit()
+    end
+    return
 end
 
-function simulate(
-    world_height,
-    world_width,
-    frozen_coords::Vector{<:Tuple{Integer,Integer}},
-    n_particles,
-    steps_to_frame,
-)
-    world = zeros(Int8, world_height, world_width)
-    for (x, y) in frozen_coords
-        world[x, y] = -1
-    end
-    particles = add_particles!(world, n_particles)
-    directions_buf = Vector{Int8}(undef, length(particles))
-
-    scene = heatmap(
-        world,
-        show_axis = false,
-        scale_plot = false,
-        resolution = size(world) .* 2,
-        colormap = [:red, :black, :white],
-    )
-    display(scene)
-
-    while true
-        run!(world, particles, directions_buf, steps_to_frame)
-        scene.plots[end][1] = world
-        sleep(0.00001)
-    end
-end
-
-simulate(WORLD_HEIGHT, WORLD_WIDTH, FROZEN_COORDS, N_PARTICLES, STEPS_TO_FRAME)
+simulate()
